@@ -1,6 +1,6 @@
 use std::{ffi, ptr};
 
-use ash::vk::{self, FALSE, PipelineDynamicStateCreateInfo, RenderingAttachmentInfo, SurfaceKHR};
+use ash::vk::{self, RenderingAttachmentInfo, SurfaceKHR};
 use winit::{
     application::ApplicationHandler,
     dpi::PhysicalSize,
@@ -8,9 +8,9 @@ use winit::{
     raw_window_handle::{HasDisplayHandle, HasWindowHandle},
     window::{Window, WindowAttributes},
 };
-static WINDOW_WIDTH: u32 = 800;
-static WINDOW_HEIGHT: u32 = 600;
-static FRAMES_IN_FLIGHT: u32 = 3;
+const WINDOW_WIDTH: u32 = 800;
+const WINDOW_HEIGHT: u32 = 600;
+const FRAMES_IN_FLIGHT: u32 = 3;
 
 fn main() {
     let mut app = App::new();
@@ -19,15 +19,11 @@ fn main() {
 }
 
 struct App {
-    window: Option<Window>,
     vulkan_state: Option<VulkanState>,
 }
 impl App {
     fn new() -> App {
-        App {
-            window: None,
-            vulkan_state: None,
-        }
+        App { vulkan_state: None }
     }
 }
 impl ApplicationHandler for App {
@@ -54,7 +50,7 @@ impl ApplicationHandler for App {
                         .unwrap();
                 }
                 // ignore suboptiomal for now, makes code more complicated than necessary
-                let (image_index, suboptimal) = unsafe {
+                let (image_index, _suboptimal) = unsafe {
                     state
                         .swapchain_loader
                         .acquire_next_image(
@@ -70,10 +66,7 @@ impl ApplicationHandler for App {
                 unsafe {
                     state
                         .device
-                        .reset_command_buffer(
-                            frame.command_buffer,
-                            vk::CommandBufferResetFlags::empty(),
-                        )
+                        .reset_command_pool(frame.command_pool, vk::CommandPoolResetFlags::empty())
                         .unwrap();
                 }
                 unsafe {
@@ -95,8 +88,7 @@ impl ApplicationHandler for App {
                     src_stage_mask: vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
                     src_access_mask: vk::AccessFlags2::empty(),
                     dst_stage_mask: vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
-                    dst_access_mask: vk::AccessFlags2::COLOR_ATTACHMENT_WRITE
-                        | vk::AccessFlags2::COLOR_ATTACHMENT_READ,
+                    dst_access_mask: vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
                     subresource_range: vk::ImageSubresourceRange {
                         aspect_mask: vk::ImageAspectFlags::COLOR,
                         level_count: 1,
@@ -110,7 +102,6 @@ impl ApplicationHandler for App {
                     state.device.cmd_pipeline_barrier2(
                         frame.command_buffer,
                         &vk::DependencyInfo {
-                            dependency_flags: vk::DependencyFlags::BY_REGION,
                             image_memory_barrier_count: 1,
                             p_image_memory_barriers: &mut swapchain_barrier as *mut _,
                             ..Default::default()
@@ -144,7 +135,7 @@ impl ApplicationHandler for App {
                                 image_view: state.swapchain_image_views
                                     [state.swapchain_image_index],
                                 image_layout: vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
-                                load_op: vk::AttachmentLoadOp::DONT_CARE,
+                                load_op: vk::AttachmentLoadOp::CLEAR,
                                 store_op: vk::AttachmentStoreOp::STORE,
                                 clear_value: vk::ClearValue {
                                     color: vk::ClearColorValue {
@@ -250,19 +241,18 @@ impl ApplicationHandler for App {
 }
 
 struct VulkanState {
-    entry: ash::Entry,
-    instance: ash::Instance,
+    _entry: ash::Entry,
+    _instance: ash::Instance,
+    _surface_loader: ash::khr::surface::Instance,
+    _surface: SurfaceKHR,
+    _physical_device: vk::PhysicalDevice,
+
     window: Window,
-    surface_loader: ash::khr::surface::Instance,
-    surface: SurfaceKHR,
-    physical_device: vk::PhysicalDevice,
-    queue_family_index: u32,
     queue: vk::Queue,
     device: ash::Device,
 
     swapchain: vk::SwapchainKHR,
     swapchain_loader: ash::khr::swapchain::Device,
-    swapchain_image_format: vk::SurfaceFormatKHR,
     swapchain_images: Vec<vk::Image>,
     swapchain_image_views: Vec<vk::ImageView>,
     render_finished: Vec<vk::Semaphore>,
@@ -275,7 +265,7 @@ struct VulkanState {
     pipeline: vk::Pipeline,
 }
 
-pub fn init(event_loop: &ActiveEventLoop) -> VulkanState {
+fn init(event_loop: &ActiveEventLoop) -> VulkanState {
     let entry = unsafe { ash::Entry::load().unwrap() };
     let window = create_window(event_loop);
     let instance = create_instance(&entry, event_loop);
@@ -531,18 +521,16 @@ pub fn init(event_loop: &ActiveEventLoop) -> VulkanState {
 
     VulkanState {
         window,
-        surface_loader,
+        _surface_loader: surface_loader,
         swapchain_loader,
-        entry,
-        instance,
+        _entry: entry,
+        _instance: instance,
         device,
-        physical_device,
+        _physical_device: physical_device,
         queue,
-        queue_family_index,
-        surface,
+        _surface: surface,
         per_frame,
         swapchain,
-        swapchain_image_format,
         swapchain_images,
         swapchain_image_views,
         image_size: window_size,
@@ -590,7 +578,6 @@ impl PerFrame {
     fn create(queue_family_index: u32, device: &mut ash::Device) -> PerFrame {
         let command_pool_create_info = vk::CommandPoolCreateInfo {
             queue_family_index,
-            flags: vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER,
             ..Default::default()
         };
         let command_pool = unsafe {
