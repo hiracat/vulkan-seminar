@@ -1,9 +1,6 @@
 use std::{ffi, ptr};
 
-use ash::{
-    khr::swapchain,
-    vk::{self, SurfaceKHR},
-};
+use ash::vk::{self, SurfaceKHR};
 use winit::{
     application::ApplicationHandler,
     dpi::PhysicalSize,
@@ -13,6 +10,7 @@ use winit::{
 };
 static WINDOW_WIDTH: u32 = 800;
 static WINDOW_HEIGHT: u32 = 600;
+static FRAMES_IN_FLIGHT: u32 = 3;
 
 fn main() {
     let mut app = App::new();
@@ -42,7 +40,7 @@ impl ApplicationHandler for App {
     fn window_event(
         &mut self,
         event_loop: &winit::event_loop::ActiveEventLoop,
-        window_id: winit::window::WindowId,
+        _window_id: winit::window::WindowId,
         event: winit::event::WindowEvent,
     ) {
         match event {
@@ -65,7 +63,15 @@ struct VulkanState {
     queue_family_index: u32,
     queue: vk::Queue,
     device: ash::Device,
+
+    swapchain: vk::SwapchainKHR,
     swapchain_loader: ash::khr::swapchain::Device,
+    swapchain_image_format: vk::SurfaceFormatKHR,
+    swapchain_images: Vec<vk::Image>,
+    swapchain_image_views: Vec<vk::ImageView>,
+    render_finished: Vec<vk::Semaphore>,
+
+    image_size: vk::Extent2D,
 }
 
 pub fn init(event_loop: &ActiveEventLoop) -> VulkanState {
@@ -90,7 +96,7 @@ pub fn init(event_loop: &ActiveEventLoop) -> VulkanState {
     let required_extensions = [ash::vk::KHR_SWAPCHAIN_NAME];
     let (physical_device, queue_family_index) =
         create_physical_device(&instance, surface, &required_extensions);
-    let (device, queue) = create_device(
+    let (mut device, queue) = create_device(
         &instance,
         physical_device,
         queue_family_index,
@@ -98,6 +104,100 @@ pub fn init(event_loop: &ActiveEventLoop) -> VulkanState {
     );
 
     let swapchain_loader = ash::khr::swapchain::Device::new(&instance, &device);
+    let capabilities = unsafe {
+        surface_loader.get_physical_device_surface_capabilities(physical_device, surface)
+    }
+    .unwrap();
+    let window_size = if capabilities.current_extent.width != u32::MAX {
+        capabilities.current_extent
+    } else {
+        let inner = window.inner_size();
+        vk::Extent2D {
+            width: inner.width.clamp(
+                capabilities.min_image_extent.width,
+                capabilities.max_image_extent.width,
+            ),
+            height: inner.height.clamp(
+                capabilities.min_image_extent.height,
+                capabilities.max_image_extent.height,
+            ),
+        }
+    };
+
+    let image_count = if capabilities.min_image_count == capabilities.max_image_count {
+        capabilities.max_image_count
+    } else {
+        capabilities.min_image_count + 1
+    };
+    let color_subresource_range = vk::ImageSubresourceRange {
+        aspect_mask: vk::ImageAspectFlags::COLOR,
+        level_count: 1,
+        layer_count: 1,
+        base_mip_level: 0,
+        base_array_layer: 0,
+    };
+    let swapchain_image_formats = unsafe {
+        surface_loader
+            .get_physical_device_surface_formats(physical_device, surface)
+            .unwrap()
+    };
+    let swapchain_image_format = choose_swapchain_format(&swapchain_image_formats).unwrap();
+
+    let swapchain_create_info = vk::SwapchainCreateInfoKHR {
+        image_usage: vk::ImageUsageFlags::COLOR_ATTACHMENT,
+        surface,
+        min_image_count: image_count,
+        image_sharing_mode: vk::SharingMode::EXCLUSIVE,
+        image_color_space: swapchain_image_format.color_space,
+        image_format: swapchain_image_format.format,
+        image_extent: window_size,
+        present_mode: vk::PresentModeKHR::FIFO,
+        pre_transform: vk::SurfaceTransformFlagsKHR::IDENTITY,
+        old_swapchain: vk::SwapchainKHR::null(),
+        composite_alpha: vk::CompositeAlphaFlagsKHR::OPAQUE,
+        clipped: vk::TRUE,
+        image_array_layers: 1,
+        p_queue_family_indices: &queue_family_index,
+        queue_family_index_count: 1,
+
+        ..Default::default()
+    };
+
+    let swapchain = unsafe {
+        swapchain_loader
+            .create_swapchain(&swapchain_create_info, None)
+            .unwrap()
+    };
+    let swapchain_images = unsafe {
+        swapchain_loader
+            .get_swapchain_images(swapchain)
+            .expect("Failed to get Swapchain Images.")
+    };
+
+    let mut swapchain_image_views = Vec::new();
+    for image in &swapchain_images {
+        let swapchain_image_view = unsafe {
+            device.create_image_view(
+                &vk::ImageViewCreateInfo {
+                    format: swapchain_image_format.format,
+                    image: *image,
+                    view_type: vk::ImageViewType::TYPE_2D,
+                    subresource_range: color_subresource_range,
+                    ..Default::default()
+                },
+                None,
+            )
+        }
+        .unwrap();
+        swapchain_image_views.push(swapchain_image_view);
+    }
+
+    let mut per_frame = Vec::new();
+    for _ in 0..FRAMES_IN_FLIGHT {
+        per_frame.push(PerFrame::create(queue_family_index, &mut device));
+    }
+
+    let render_finished = create_semaphores(&device, swapchain_images.len());
 
     VulkanState {
         window,
@@ -110,6 +210,81 @@ pub fn init(event_loop: &ActiveEventLoop) -> VulkanState {
         queue,
         queue_family_index,
         surface,
+        swapchain,
+        swapchain_image_format,
+        swapchain_images,
+        swapchain_image_views,
+        image_size: window_size,
+        render_finished,
+    }
+}
+
+pub fn create_semaphores(device: &ash::Device, count: usize) -> Vec<vk::Semaphore> {
+    let mut semaphores = Vec::with_capacity(count);
+    for _ in 0..count {
+        semaphores.push(unsafe {
+            device
+                .create_semaphore(&vk::SemaphoreCreateInfo::default(), None)
+                .unwrap()
+        });
+    }
+    semaphores
+}
+
+struct PerFrame {
+    command_pool: vk::CommandPool,
+    command_buffer: vk::CommandBuffer,
+    in_flight: vk::Fence,
+    image_available: vk::Semaphore,
+}
+impl PerFrame {
+    fn create(queue_family_index: u32, device: &mut ash::Device) -> PerFrame {
+        let command_pool_create_info = vk::CommandPoolCreateInfo {
+            queue_family_index,
+            flags: vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER,
+            ..Default::default()
+        };
+        let command_pool = unsafe {
+            device
+                .create_command_pool(&command_pool_create_info, None)
+                .unwrap()
+        };
+        let command_buffer_alloc_info = vk::CommandBufferAllocateInfo {
+            command_pool,
+            command_buffer_count: 1,
+            level: vk::CommandBufferLevel::PRIMARY,
+            ..Default::default()
+        };
+        let command_buffer = unsafe {
+            device
+                .allocate_command_buffers(&command_buffer_alloc_info)
+                .unwrap()
+                .first()
+                .copied()
+                .unwrap()
+        };
+        let in_flight = unsafe {
+            device.create_fence(
+                &vk::FenceCreateInfo {
+                    flags: vk::FenceCreateFlags::SIGNALED,
+                    ..Default::default()
+                },
+                None,
+            )
+        }
+        .unwrap();
+
+        let image_available = unsafe {
+            device
+                .create_semaphore(&vk::SemaphoreCreateInfo::default(), None)
+                .unwrap()
+        };
+        Self {
+            command_pool,
+            command_buffer,
+            in_flight,
+            image_available,
+        }
     }
 }
 
@@ -273,4 +448,22 @@ pub fn create_device(
     let queue = unsafe { device.get_device_queue(queue_family_index, 0) };
 
     (device, queue)
+}
+pub fn choose_swapchain_format(formats: &[vk::SurfaceFormatKHR]) -> Option<vk::SurfaceFormatKHR> {
+    let preferred_color_space = vk::ColorSpaceKHR::SRGB_NONLINEAR;
+    let preferred_formats = vec![
+        vk::Format::B8G8R8A8_SRGB,
+        vk::Format::R8G8B8A8_SRGB,
+        vk::Format::B8G8R8A8_UNORM,
+        vk::Format::R8G8B8A8_UNORM,
+    ];
+
+    for available in formats {
+        for format in &preferred_formats {
+            if available.format == *format && available.color_space == preferred_color_space {
+                return Some(*available);
+            }
+        }
+    }
+    formats.first().copied()
 }
